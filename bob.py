@@ -424,14 +424,19 @@ async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
 
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
-    if before.communication_disabled_until != after.communication_disabled_until:
+    # Timeouts (safe for your lib)
+    before_timeout = getattr(before, "timed_out_until", None)
+    after_timeout = getattr(after, "timed_out_until", None)
+
+    if before_timeout != after_timeout:
         await send_log(
             "Timeout Updated",
             f"**User:** {after} ({after.id})\n"
-            f"**Before:** {before.communication_disabled_until}\n"
-            f"**After:** {after.communication_disabled_until}"
+            f"**Before:** {before_timeout}\n"
+            f"**After:** {after_timeout}"
         )
 
+    # Roles added/removed
     before_roles = set(before.roles)
     after_roles = set(after.roles)
 
