@@ -1,228 +1,215 @@
 import discord
-from discord.ext import commands
 from discord import app_commands
+from discord.ext import commands
 import psycopg2
+import psycopg2.extras
 import os
-
-# -----------------------------
-# DATABASE CONNECTION
-# -----------------------------
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-conn = psycopg2.connect(DATABASE_URL, sslmode="require")
-conn.autocommit = True  # avoid lingering failed transactions
-cur = conn.cursor()
-
-# -----------------------------
-# ENSURE TABLE + COLUMNS EXIST
-# -----------------------------
-# 1) Ensure table exists
-cur.execute("""
-CREATE TABLE IF NOT EXISTS infractions (
-    id SERIAL PRIMARY KEY
-);
-""")
-
-# 2) Ensure required columns exist (migration-safe)
-cur.execute("""
-ALTER TABLE infractions
-    ADD COLUMN IF NOT EXISTS guild_id BIGINT,
-    ADD COLUMN IF NOT EXISTS user_id BIGINT,
-    ADD COLUMN IF NOT EXISTS moderator_id BIGINT,
-    ADD COLUMN IF NOT EXISTS reason TEXT,
-    ADD COLUMN IF NOT EXISTS timestamp TIMESTAMP DEFAULT NOW();
-""")
+from datetime import datetime
 
 # -----------------------------
 # BOT SETUP
 # -----------------------------
-intents = discord.Intents.all()
+intents = discord.Intents.default()
+intents.members = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-GREEN_CHECK = "✅"
-WIND_PHRASE = "It must’ve been the wind."
+# -----------------------------
+# DATABASE CONNECTION FUNCTION
+# -----------------------------
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+def get_conn():
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 # -----------------------------
-# HELPER: WHITE EMBED
+# CREATE TABLE
 # -----------------------------
-def white_embed(title: str, description: str):
-    embed = discord.Embed(
-        title=title,
-        description=description,
-        color=discord.Color.from_rgb(255, 255, 255)
-    )
-    return embed
+with get_conn() as conn:
+    with conn.cursor() as cursor:
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS infractions (
+            id SERIAL PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            moderator_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            reason TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+        conn.commit()
 
 # -----------------------------
-# /WARN COMMAND
+# LOG INFRACTION
 # -----------------------------
-@bot.tree.command(name="warn", description="Warn a user and save it to the database")
-@app_commands.checks.has_permissions(manage_messages=True)
+def log_infraction(user_id: str, moderator_id: str, action: str, reason: str):
+    with get_conn() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO infractions (user_id, moderator_id, action, reason)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id
+            """, (user_id, moderator_id, action, reason))
+            case_id = cursor.fetchone()[0]
+            conn.commit()
+            return case_id
+
+# -----------------------------
+# SAFETY CHECK
+# -----------------------------
+async def can_punish(interaction, user):
+    if user == interaction.user:
+        await interaction.response.send_message("You can't punish yourself.", ephemeral=True)
+        return False
+
+    if user.top_role >= interaction.user.top_role:
+        await interaction.response.send_message("You can't punish this user.", ephemeral=True)
+        return False
+
+    return True
+
+# -----------------------------
+# WARN COMMAND
+# -----------------------------
+@bot.tree.command(name="warn", description="Warn a user")
+@app_commands.checks.has_permissions(ban_members=True)
 async def warn(interaction: discord.Interaction, user: discord.Member, reason: str):
-    # Save to DB
-    with conn.cursor() as c:
-        c.execute(
-            "INSERT INTO infractions (guild_id, user_id, moderator_id, reason) VALUES (%s, %s, %s, %s)",
-            (interaction.guild.id, user.id, interaction.user.id, reason)
-        )
 
-    # DM user
+    if not await can_punish(interaction, user):
+        return
+
+    case_id = log_infraction(str(user.id), str(interaction.user.id), "warn", reason)
+
     try:
-        await user.send(f"You have been **warned** in **{interaction.guild.name}**.\nReason: {reason}")
-    except:
+        await user.send(f"You were warned in Roommates for: {reason}")
+    except discord.Forbidden:
         pass
 
-    # Embed (white + green check)
-    embed = white_embed(
-        f"{GREEN_CHECK} {user.name} has been warned.",
-        f"**Reason:** {reason}"
+    embed = discord.Embed(
+        title="⚠️ User Warned",
+        color=discord.Color.green(),
+        timestamp=datetime.utcnow()
     )
+    embed.add_field(name="User", value=user.mention)
+    embed.add_field(name="Reason", value=reason, inline=False)
+    embed.add_field(name="Moderator", value=interaction.user.mention)
+    embed.set_footer(text=f"Case ID: #{case_id}")
 
     await interaction.response.send_message(embed=embed)
 
 # -----------------------------
-# /UNWARN COMMAND
+# KICK COMMAND
 # -----------------------------
-@bot.tree.command(name="unwarn", description="Remove the latest or a specific warning")
-@app_commands.checks.has_permissions(manage_messages=True)
-async def unwarn(interaction: discord.Interaction, user: discord.Member, infraction_id: int = None):
-    if infraction_id:
-        with conn.cursor() as c:
-            c.execute(
-                "DELETE FROM infractions WHERE id = %s AND user_id = %s AND guild_id = %s RETURNING id",
-                (infraction_id, user.id, interaction.guild.id)
-            )
-            deleted = c.fetchone()
-
-        if deleted:
-            embed = white_embed(
-                f"{GREEN_CHECK} Warning removed.",
-                f"Removed infraction ID **{infraction_id}** for **{user.name}**."
-            )
-        else:
-            embed = white_embed(
-                "⚠️ No matching infraction found.",
-                "That infraction ID does not exist for this user."
-            )
-        return await interaction.response.send_message(embed=embed)
-
-    # Remove latest warning
-    with conn.cursor() as c:
-        c.execute(
-            "SELECT id FROM infractions WHERE user_id = %s AND guild_id = %s ORDER BY id DESC LIMIT 1",
-            (user.id, interaction.guild.id)
-        )
-        row = c.fetchone()
-
-    if not row:
-        return await interaction.response.send_message(
-            embed=white_embed("⚠️ No warnings found.", f"{user.name} has no warnings.")
-        )
-
-    latest_id = row[0]
-
-    with conn.cursor() as c:
-        c.execute("DELETE FROM infractions WHERE id = %s", (latest_id,))
-
-    embed = white_embed(
-        f"{GREEN_CHECK} Latest warning removed.",
-        f"Removed infraction ID **{latest_id}** for **{user.name}**."
-    )
-    await interaction.response.send_message(embed=embed)
-
-# -----------------------------
-# /KICK COMMAND
-# -----------------------------
-@bot.tree.command(name="kick", description="Kick a user from the server")
-@app_commands.checks.has_permissions(kick_members=True)
+@bot.tree.command(name="kick", description="Kick a user")
+@app_commands.checks.has_permissions(ban_members=True)
 async def kick(interaction: discord.Interaction, user: discord.Member, reason: str):
-    # DM user
+
+    if not await can_punish(interaction, user):
+        return
+
     try:
-        await user.send(f"You were kicked from **{interaction.guild.name}**.\nReason: {reason}")
-    except:
+        await user.send(f"You were kicked in Roommates for: {reason}")
+    except discord.Forbidden:
         pass
 
-    await user.kick(reason=reason)
+    try:
+        await user.kick(reason=reason)
+    except:
+        await interaction.response.send_message("Failed to kick user.", ephemeral=True)
+        return
 
-    embed = white_embed(
-        f"{GREEN_CHECK} {user.name} has been kicked.",
-        f"{WIND_PHRASE}\n\n**Reason:** {reason}"
+    case_id = log_infraction(str(user.id), str(interaction.user.id), "kick", reason)
+
+    embed = discord.Embed(
+        title="👢 User Kicked",
+        color=discord.Color.green(),
+        timestamp=datetime.utcnow()
     )
+    embed.add_field(name="User", value=user.mention)
+    embed.add_field(name="Reason", value=reason, inline=False)
+    embed.add_field(name="Moderator", value=interaction.user.mention)
+    embed.set_footer(text=f"Case ID: #{case_id}")
 
     await interaction.response.send_message(embed=embed)
 
 # -----------------------------
-# /BAN COMMAND
+# BAN COMMAND
 # -----------------------------
-@bot.tree.command(name="ban", description="Ban a user from the server")
+@bot.tree.command(name="ban", description="Ban a user")
 @app_commands.checks.has_permissions(ban_members=True)
 async def ban(interaction: discord.Interaction, user: discord.Member, reason: str):
-    # DM user
+
+    if not await can_punish(interaction, user):
+        return
+
     try:
-        await user.send(f"You were banned from **{interaction.guild.name}**.\nReason: {reason}")
-    except:
+        await user.send(
+            f"You were banned in Roommates for: {reason}\n\n"
+            f"Appeal: https://discord.gg/JgNxTSuRWn"
+        )
+    except discord.Forbidden:
         pass
 
-    await user.ban(reason=reason)
+    try:
+        await user.ban(reason=reason)
+    except:
+        await interaction.response.send_message("Failed to ban user.", ephemeral=True)
+        return
 
-    embed = white_embed(
-        f"{GREEN_CHECK} {user.name} has been banned.",
-        f"{WIND_PHRASE}\n\n**Reason:** {reason}"
+    case_id = log_infraction(str(user.id), str(interaction.user.id), "ban", reason)
+
+    embed = discord.Embed(
+        title="🔨 User Banned",
+        color=discord.Color.green(),
+        timestamp=datetime.utcnow()
     )
+    embed.add_field(name="User", value=user.mention)
+    embed.add_field(name="Reason", value=reason, inline=False)
+    embed.add_field(name="Moderator", value=interaction.user.mention)
+    embed.set_footer(text=f"Case ID: #{case_id}")
 
     await interaction.response.send_message(embed=embed)
 
 # -----------------------------
-# /INFRACTIONS COMMAND
+# INFRACTIONS COMMAND
 # -----------------------------
-@bot.tree.command(name="infractions", description="View a user's warnings")
+@bot.tree.command(name="infractions", description="View infractions")
+@app_commands.checks.has_permissions(ban_members=True)
 async def infractions(interaction: discord.Interaction, user: discord.Member):
-    with conn.cursor() as c:
-        c.execute(
-            "SELECT id, reason, timestamp FROM infractions WHERE user_id = %s AND guild_id = %s ORDER BY id ASC",
-            (user.id, interaction.guild.id)
-        )
-        rows = c.fetchall()
+
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+            cursor.execute("""
+                SELECT id, action, reason, timestamp, moderator_id
+                FROM infractions
+                WHERE user_id = %s
+                ORDER BY timestamp DESC
+            """, (str(user.id),))
+            rows = cursor.fetchall()
 
     if not rows:
-        return await interaction.response.send_message(
-            embed=white_embed("No warnings found.", f"{user.name} has no infractions.")
+        await interaction.response.send_message(
+            f"{user.mention} has no infractions.",
+            ephemeral=True
         )
+        return
 
-    desc = ""
-    for inf in rows:
-        ts = inf[2]
-        try:
-            unix_ts = int(ts.timestamp())
-            time_str = f"<t:{unix_ts}:R>"
-        except:
-            time_str = str(ts)
-        desc += f"**ID {inf[0]}** — {inf[1]} *({time_str})*\n"
-
-    embed = white_embed(f"Infractions for {user.name}", desc)
-    await interaction.response.send_message(embed=embed)
-
-# -----------------------------
-# /CLEARINFRACTIONS COMMAND
-# -----------------------------
-@bot.tree.command(name="clearinfractions", description="Clear all warnings for a user")
-@app_commands.checks.has_permissions(manage_messages=True)
-async def clearinfractions(interaction: discord.Interaction, user: discord.Member):
-    with conn.cursor() as c:
-        c.execute(
-            "DELETE FROM infractions WHERE user_id = %s AND guild_id = %s",
-            (user.id, interaction.guild.id)
-        )
-
-    embed = white_embed(
-        f"{GREEN_CHECK} Infractions cleared.",
-        f"All warnings for **{user.name}** have been removed."
+    embed = discord.Embed(
+        title=f"📄 Infractions for {user.display_name}",
+        color=discord.Color.green()
     )
 
-    await interaction.response.send_message(embed=embed)
+    for row in rows:
+        embed.add_field(
+            name=f"#{row['id']} • {row['action'].upper()} — <@{row['moderator_id']}>",
+            value=f"**Reason:** {row['reason']}\n<t:{int(row['timestamp'].timestamp())}:R>",
+            inline=False
+        )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # -----------------------------
-# SYNC COMMAND TREE
+# READY EVENT
 # -----------------------------
 @bot.event
 async def on_ready():
@@ -232,5 +219,4 @@ async def on_ready():
 # -----------------------------
 # RUN BOT
 # -----------------------------
-TOKEN = os.getenv("TOKEN")
-bot.run(TOKEN)
+bot.run(os.getenv("TOKEN"))
