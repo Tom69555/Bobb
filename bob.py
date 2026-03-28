@@ -37,6 +37,44 @@ ALTER TABLE infractions
     ALTER COLUMN guild_id TYPE BIGINT USING guild_id::bigint,
     ALTER COLUMN moderator_id TYPE BIGINT USING moderator_id::bigint;
 """)
+# -----------------------------
+# /UNBAN COMMAND
+# -----------------------------
+@bot.tree.command(name="unban", description="Unban a user from the server")
+@app_commands.checks.has_permissions(ban_members=True)
+async def unban(interaction: discord.Interaction, user_id: str):
+
+    try:
+        user_id_int = int(user_id)
+    except ValueError:
+        return await interaction.response.send_message(
+            embed=green_embed("Invalid ID", "User ID must be a number.")
+        )
+
+    try:
+        user = await bot.fetch_user(user_id_int)
+    except:
+        return await interaction.response.send_message(
+            embed=green_embed("User Not Found", "Discord could not find a user with that ID.")
+        )
+
+    try:
+        await interaction.guild.unban(user)
+    except discord.NotFound:
+        return await interaction.response.send_message(
+            embed=green_embed("Not Banned", "This user is not banned from the server.")
+        )
+    except discord.Forbidden:
+        return await interaction.response.send_message(
+            embed=green_embed("Missing Permissions", "I do not have permission to unban this user.")
+        )
+
+    embed = green_embed(
+        f"{GREEN_CHECK} User Unbanned",
+        f"{user} has been unbanned."
+    )
+
+    await interaction.response.send_message(embed=embed)
 
 # -----------------------------
 # BOT SETUP
