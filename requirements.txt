@@ -1,2 +1,2 @@
-bob.py
+discord.py
 psycopg2-binary
