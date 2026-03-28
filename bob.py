@@ -10,19 +10,28 @@ import os
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+conn.autocommit = True  # avoid lingering failed transactions
 cur = conn.cursor()
 
+# -----------------------------
+# ENSURE TABLE + COLUMNS EXIST
+# -----------------------------
+# 1) Ensure table exists
 cur.execute("""
 CREATE TABLE IF NOT EXISTS infractions (
-    id SERIAL PRIMARY KEY,
-    guild_id BIGINT,
-    user_id BIGINT,
-    moderator_id BIGINT,
-    reason TEXT,
-    timestamp TIMESTAMP DEFAULT NOW()
+    id SERIAL PRIMARY KEY
 );
 """)
-conn.commit()
+
+# 2) Ensure required columns exist (migration-safe)
+cur.execute("""
+ALTER TABLE infractions
+    ADD COLUMN IF NOT EXISTS guild_id BIGINT,
+    ADD COLUMN IF NOT EXISTS user_id BIGINT,
+    ADD COLUMN IF NOT EXISTS moderator_id BIGINT,
+    ADD COLUMN IF NOT EXISTS reason TEXT,
+    ADD COLUMN IF NOT EXISTS timestamp TIMESTAMP DEFAULT NOW();
+""")
 
 # -----------------------------
 # BOT SETUP
@@ -51,11 +60,11 @@ def white_embed(title: str, description: str):
 @app_commands.checks.has_permissions(manage_messages=True)
 async def warn(interaction: discord.Interaction, user: discord.Member, reason: str):
     # Save to DB
-    cur.execute(
-        "INSERT INTO infractions (guild_id, user_id, moderator_id, reason) VALUES (%s, %s, %s, %s)",
-        (interaction.guild.id, user.id, interaction.user.id, reason)
-    )
-    conn.commit()
+    with conn.cursor() as c:
+        c.execute(
+            "INSERT INTO infractions (guild_id, user_id, moderator_id, reason) VALUES (%s, %s, %s, %s)",
+            (interaction.guild.id, user.id, interaction.user.id, reason)
+        )
 
     # DM user
     try:
@@ -77,14 +86,13 @@ async def warn(interaction: discord.Interaction, user: discord.Member, reason: s
 @bot.tree.command(name="unwarn", description="Remove the latest or a specific warning")
 @app_commands.checks.has_permissions(manage_messages=True)
 async def unwarn(interaction: discord.Interaction, user: discord.Member, infraction_id: int = None):
-    # If specific ID provided
     if infraction_id:
-        cur.execute(
-            "DELETE FROM infractions WHERE id = %s AND user_id = %s AND guild_id = %s RETURNING id",
-            (infraction_id, user.id, interaction.guild.id)
-        )
-        deleted = cur.fetchone()
-        conn.commit()
+        with conn.cursor() as c:
+            c.execute(
+                "DELETE FROM infractions WHERE id = %s AND user_id = %s AND guild_id = %s RETURNING id",
+                (infraction_id, user.id, interaction.guild.id)
+            )
+            deleted = c.fetchone()
 
         if deleted:
             embed = white_embed(
@@ -98,12 +106,13 @@ async def unwarn(interaction: discord.Interaction, user: discord.Member, infract
             )
         return await interaction.response.send_message(embed=embed)
 
-    # Otherwise remove latest
-    cur.execute(
-        "SELECT id FROM infractions WHERE user_id = %s AND guild_id = %s ORDER BY id DESC LIMIT 1",
-        (user.id, interaction.guild.id)
-    )
-    row = cur.fetchone()
+    # Remove latest warning
+    with conn.cursor() as c:
+        c.execute(
+            "SELECT id FROM infractions WHERE user_id = %s AND guild_id = %s ORDER BY id DESC LIMIT 1",
+            (user.id, interaction.guild.id)
+        )
+        row = c.fetchone()
 
     if not row:
         return await interaction.response.send_message(
@@ -112,8 +121,8 @@ async def unwarn(interaction: discord.Interaction, user: discord.Member, infract
 
     latest_id = row[0]
 
-    cur.execute("DELETE FROM infractions WHERE id = %s", (latest_id,))
-    conn.commit()
+    with conn.cursor() as c:
+        c.execute("DELETE FROM infractions WHERE id = %s", (latest_id,))
 
     embed = white_embed(
         f"{GREEN_CHECK} Latest warning removed.",
@@ -168,11 +177,12 @@ async def ban(interaction: discord.Interaction, user: discord.Member, reason: st
 # -----------------------------
 @bot.tree.command(name="infractions", description="View a user's warnings")
 async def infractions(interaction: discord.Interaction, user: discord.Member):
-    cur.execute(
-        "SELECT id, reason, timestamp FROM infractions WHERE user_id = %s AND guild_id = %s ORDER BY id ASC",
-        (user.id, interaction.guild.id)
-    )
-    rows = cur.fetchall()
+    with conn.cursor() as c:
+        c.execute(
+            "SELECT id, reason, timestamp FROM infractions WHERE user_id = %s AND guild_id = %s ORDER BY id ASC",
+            (user.id, interaction.guild.id)
+        )
+        rows = c.fetchall()
 
     if not rows:
         return await interaction.response.send_message(
@@ -181,7 +191,13 @@ async def infractions(interaction: discord.Interaction, user: discord.Member):
 
     desc = ""
     for inf in rows:
-        desc += f"**ID {inf[0]}** — {inf[1]} *(<t:{int(inf[2].timestamp())}:R>)*\n"
+        ts = inf[2]
+        try:
+            unix_ts = int(ts.timestamp())
+            time_str = f"<t:{unix_ts}:R>"
+        except:
+            time_str = str(ts)
+        desc += f"**ID {inf[0]}** — {inf[1]} *({time_str})*\n"
 
     embed = white_embed(f"Infractions for {user.name}", desc)
     await interaction.response.send_message(embed=embed)
@@ -192,11 +208,11 @@ async def infractions(interaction: discord.Interaction, user: discord.Member):
 @bot.tree.command(name="clearinfractions", description="Clear all warnings for a user")
 @app_commands.checks.has_permissions(manage_messages=True)
 async def clearinfractions(interaction: discord.Interaction, user: discord.Member):
-    cur.execute(
-        "DELETE FROM infractions WHERE user_id = %s AND guild_id = %s",
-        (user.id, interaction.guild.id)
-    )
-    conn.commit()
+    with conn.cursor() as c:
+        c.execute(
+            "DELETE FROM infractions WHERE user_id = %s AND guild_id = %s",
+            (user.id, interaction.guild.id)
+        )
 
     embed = white_embed(
         f"{GREEN_CHECK} Infractions cleared.",
