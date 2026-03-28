@@ -11,6 +11,9 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TOKEN = os.getenv("TOKEN")
 LOG_CHANNEL_ID = 1476717008010870812
 
+AUTO_ROLE_1 = 1476717006794264598
+AUTO_ROLE_2 = 1485452341200289975
+
 # -----------------------------
 # DATABASE CONNECTION
 # -----------------------------
@@ -80,6 +83,30 @@ async def send_log(title: str, description: str = None):
             return
     await channel.send(embed=green_embed(title, description))
 
+# -----------------------------
+# AUTO-ROLES + JOIN LOGGING
+# -----------------------------
+@bot.event
+async def on_member_join(member: discord.Member):
+
+    # Auto roles
+    role1 = member.guild.get_role(AUTO_ROLE_1)
+    role2 = member.guild.get_role(AUTO_ROLE_2)
+
+    try:
+        if role1:
+            await member.add_roles(role1)
+        if role2:
+            await member.add_roles(role2)
+    except:
+        pass
+
+    # Log join
+    await send_log(
+        "Member Joined",
+        f"**User:** {member} ({member.id})\n"
+        f"**Server:** {member.guild.name}"
+    )
 # -----------------------------
 # /WARN
 # -----------------------------
@@ -356,18 +383,9 @@ async def clearinfractions(interaction: discord.Interaction, user: discord.Membe
         f"**User:** {user} ({user.id})\n"
         f"**Moderator:** {interaction.user} ({interaction.user.id})"
     )
-
 # -----------------------------
 # LOGGING EVENTS
 # -----------------------------
-@bot.event
-async def on_member_join(member: discord.Member):
-    await send_log(
-        "Member Joined",
-        f"**User:** {member} ({member.id})\n"
-        f"**Server:** {member.guild.name}"
-    )
-
 @bot.event
 async def on_member_remove(member: discord.Member):
     await send_log(
@@ -394,8 +412,10 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
         return
     if before.content == after.content:
         return
+
     before_content = before.content or "*No content*"
     after_content = after.content or "*No content*"
+
     await send_log(
         "Message Edited",
         f"**Author:** {before.author} ({before.author.id})\n"
@@ -424,7 +444,7 @@ async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
 
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
-    # Timeouts (safe for your lib)
+    # ---- TIMEOUT LOGGING (SAFE FOR YOUR LIB) ----
     before_timeout = getattr(before, "timed_out_until", None)
     after_timeout = getattr(after, "timed_out_until", None)
 
@@ -436,7 +456,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             f"**After:** {after_timeout}"
         )
 
-    # Roles added/removed
+    # ---- ROLE CHANGES ----
     before_roles = set(before.roles)
     after_roles = set(after.roles)
 
