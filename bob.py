@@ -4,6 +4,7 @@ from discord import app_commands
 import psycopg2
 import psycopg2.extras
 import os
+import asyncio
 from datetime import datetime
 
 # ──────────────────────────────────────────────
@@ -38,9 +39,27 @@ async def dlog(tag: str, message: str):
     try:
         ch = bot.get_channel(DEBUG_CHANNEL_ID)
         if ch:
-            await ch.send(f"```\n{line}\n```")
+            await safe_send(ch.send(f"```\n{line}\n```"))
     except Exception:
         pass
+
+async def safe_send(coro, retries: int = 3, base_delay: float = 1.0):
+    """
+    Await a coroutine, automatically retrying on 429 rate-limit responses.
+    Returns the result or None if all retries fail.
+    """
+    for attempt in range(retries):
+        try:
+            return await coro
+        except discord.HTTPException as e:
+            if e.status == 429:
+                retry_after = getattr(e, "retry_after", base_delay * (attempt + 1))
+                log("RATE-LIMIT", f"429 hit — retrying in {retry_after:.1f}s (attempt {attempt + 1}/{retries})")
+                await asyncio.sleep(retry_after)
+            else:
+                raise
+    log("RATE-LIMIT", "All retries exhausted — request dropped.")
+    return None
 
 async def send_log(title: str, description: str = None, colour: discord.Colour = None):
     """Send a formatted embed to the moderation log channel."""
@@ -52,7 +71,7 @@ async def send_log(title: str, description: str = None, colour: discord.Colour =
         ch = bot.get_channel(LOG_CHANNEL_ID)
         if ch is None:
             ch = await bot.fetch_channel(LOG_CHANNEL_ID)
-        await ch.send(embed=embed)
+        await safe_send(ch.send(embed=embed))
     except Exception as e:
         log("LOG", f"Failed to send log '{title}': {e}")
 
@@ -166,9 +185,11 @@ async def warn(interaction: discord.Interaction, user: discord.Member, reason: s
     infraction_id = cur.fetchone()[0]
 
     try:
-        await user.send(embed=red_embed("⚠️ You have been warned", f"**Server:** {interaction.guild.name}\n**Reason:** {reason}"))
+        await safe_send(user.send(embed=red_embed("⚠️ You have been warned", f"**Server:** {interaction.guild.name}\n**Reason:** {reason}")))
     except Exception:
         pass
+
+    await asyncio.sleep(0.5)  # small buffer between DM and followup
 
     await interaction.followup.send(
         embed=green_embed(f"{GREEN_CHECK} {user.display_name} has been warned.", f"Infraction ID: `{infraction_id}`")
@@ -257,7 +278,7 @@ async def kick(interaction: discord.Interaction, user: discord.Member, reason: s
         return
 
     try:
-        await user.send(embed=red_embed("🦵 You have been kicked", f"**Server:** {interaction.guild.name}\n**Reason:** {reason}"))
+        await safe_send(user.send(embed=red_embed("🦵 You have been kicked", f"**Server:** {interaction.guild.name}\n**Reason:** {reason}")))
     except Exception:
         pass
 
@@ -299,10 +320,10 @@ async def ban(interaction: discord.Interaction, user: discord.Member, reason: st
     view.add_item(discord.ui.Button(label="Appeal Here", url="https://discord.gg/HDwzGxfKQ8"))
 
     try:
-        await user.send(
+        await safe_send(user.send(
             embed=red_embed("🔨 You have been banned", f"**Server:** {interaction.guild.name}\n**Reason:** {reason}"),
             view=view,
-        )
+        ))
     except Exception:
         pass
 
@@ -669,3 +690,4 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 # ──────────────────────────────────────────────
 log("STARTUP", "Starting bot...")
 bot.run(TOKEN)
+
