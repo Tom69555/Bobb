@@ -722,8 +722,23 @@ async def fetch_roblox_ccu(universe_id: int) -> int | None:
         log("CCU", f"Error fetching CCU: {e}")
         return None
 
+# Stores the message ID of the persistent CCU embed so we can edit it each tick
+ccu_message_id: int | None = None
+
+def build_ccu_embed(ccu: int, peak: int) -> discord.Embed:
+    embed = discord.Embed(
+        title="🎮 RoomMates — Live Players",
+        color=discord.Color.from_rgb(255, 255, 255),
+    )
+    embed.add_field(name="🟢 Current CCU", value=f"**{ccu}**", inline=True)
+    embed.add_field(name="🏆 Highest CCU", value=f"**{peak}**", inline=True)
+    embed.set_footer(text="Updates every minute")
+    embed.timestamp = datetime.utcnow()
+    return embed
+
 @tasks.loop(seconds=CCU_UPDATE_INTERVAL)
 async def update_ccu():
+    global ccu_message_id
     await bot.wait_until_ready()
 
     channel = bot.get_channel(CCU_CHANNEL_ID)
@@ -739,47 +754,55 @@ async def update_ccu():
         log("CCU", "Skipping update — could not retrieve CCU.")
         return
 
-    new_name = f"🎮 RoomMates | {ccu} online"
-
-    # Only rename if it changed (Discord rate-limits channel renames to 2/10min)
-    if channel.name != new_name:
-        try:
-            await channel.edit(name=new_name)
-            log("CCU", f"Channel updated → '{new_name}'")
-        except discord.RateLimited as e:
-            log("CCU", f"Rate limited on channel rename — retry in {e.retry_after:.0f}s")
-        except Exception as e:
-            log("CCU", f"Failed to rename channel: {e}")
-
-    # Check for new all-time peak (read from and write to DB)
     try:
         current_peak = db_get_peak()
     except Exception as e:
         log("CCU", f"Failed to read peak from DB: {e}")
         return
 
-    if ccu > current_peak:
+    new_peak = ccu > current_peak
+    if new_peak:
         try:
             db_set_peak(ccu)
+            current_peak = ccu
+            log("CCU", f"New peak saved to DB: {ccu}")
         except Exception as e:
             log("CCU", f"Failed to write new peak to DB: {e}")
             return
 
-        log("CCU", f"New peak CCU! {current_peak} → {ccu} (saved to DB)")
+    embed = build_ccu_embed(ccu, current_peak)
+
+    # Try to edit the existing embed message
+    if ccu_message_id:
         try:
-            embed = discord.Embed(
-                title="🏆 New Peak CCU!",
-                description=(
-                    f"**{ccu} players** are currently online — a new all-time record!\n"
-                    f"Previous peak: **{current_peak}**"
-                ),
-                color=discord.Color.gold(),
-            )
-            embed.timestamp = datetime.utcnow()
-            await safe_send(channel.send(content="@here", embed=embed))
-            await dlog("CCU", f"New peak CCU reached: {ccu} (was {current_peak}) — saved to DB")
+            msg = await channel.fetch_message(ccu_message_id)
+            await msg.edit(embed=embed)
+            log("CCU", f"Embed updated — CCU: {ccu}, Peak: {current_peak}")
+        except discord.NotFound:
+            ccu_message_id = None  # message was deleted, send a new one
         except Exception as e:
-            log("CCU", f"Failed to send peak CCU message: {e}")
+            log("CCU", f"Failed to edit CCU embed: {e}")
+            return
+
+    # Send a fresh embed if we don't have one yet (first run or message was deleted)
+    if not ccu_message_id:
+        try:
+            msg = await safe_send(channel.send(embed=embed))
+            if msg:
+                ccu_message_id = msg.id
+                log("CCU", f"CCU embed posted (message ID: {msg.id})")
+        except Exception as e:
+            log("CCU", f"Failed to send CCU embed: {e}")
+            return
+
+    # Ghost ping @here on new peak
+    if new_peak:
+        try:
+            ghost = await channel.send("@here")
+            await ghost.delete()
+            await dlog("CCU", f"New peak CCU: {ccu} — ghost ping sent, DB updated")
+        except Exception as e:
+            log("CCU", f"Failed to send ghost ping: {e}")
 
 # ──────────────────────────────────────────────
 #  ERROR HANDLER
