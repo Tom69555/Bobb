@@ -2,408 +2,521 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import psycopg2
+import psycopg2.extras
 import os
+from datetime import datetime
 
-# -----------------------------
-# CONFIG
-# -----------------------------
-DATABASE_URL = os.getenv("DATABASE_URL")
-TOKEN = os.getenv("TOKEN")
-LOG_CHANNEL_ID = 1476717008010870812
+# ──────────────────────────────────────────────
+#  CONFIGURATION
+# ──────────────────────────────────────────────
+DATABASE_URL   = os.getenv("DATABASE_URL")
+TOKEN          = os.getenv("TOKEN")
+
+DEBUG_CHANNEL_ID = 1487755467949211709   # internal debug logs
+LOG_CHANNEL_ID   = 1476717008010870812   # moderation / server logs
 
 AUTO_ROLE_1 = 1476717006794264598
 AUTO_ROLE_2 = 1485452341200289975
 
-# -----------------------------
-# DATABASE CONNECTION
-# -----------------------------
+GREEN_CHECK  = "✅"
+WIND_PHRASE  = "It must've been the wind."
+
+# ──────────────────────────────────────────────
+#  LOGGING HELPERS
+# ──────────────────────────────────────────────
+def _ts() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def log(tag: str, message: str):
+    line = f"[{_ts()}] [{tag}] {message}"
+    print(line)
+    return line
+
+async def dlog(tag: str, message: str):
+    """Console + Discord debug channel."""
+    line = log(tag, message)
+    try:
+        ch = bot.get_channel(DEBUG_CHANNEL_ID)
+        if ch:
+            await ch.send(f"```\n{line}\n```")
+    except Exception:
+        pass
+
+async def send_log(title: str, description: str = None, colour: discord.Colour = None):
+    """Send a formatted embed to the moderation log channel."""
+    if colour is None:
+        colour = discord.Color.green()
+    embed = discord.Embed(title=title, description=description, color=colour)
+    embed.timestamp = datetime.utcnow()
+    try:
+        ch = bot.get_channel(LOG_CHANNEL_ID)
+        if ch is None:
+            ch = await bot.fetch_channel(LOG_CHANNEL_ID)
+        await ch.send(embed=embed)
+    except Exception as e:
+        log("LOG", f"Failed to send log '{title}': {e}")
+
+# ──────────────────────────────────────────────
+#  EMBED HELPERS
+# ──────────────────────────────────────────────
+def green_embed(title: str, description: str = None) -> discord.Embed:
+    return discord.Embed(title=title, description=description, color=discord.Color.green())
+
+def red_embed(title: str, description: str = None) -> discord.Embed:
+    return discord.Embed(title=title, description=description, color=discord.Color.red())
+
+def orange_embed(title: str, description: str = None) -> discord.Embed:
+    return discord.Embed(title=title, description=description, color=discord.Color.orange())
+
+# ──────────────────────────────────────────────
+#  DATABASE
+# ──────────────────────────────────────────────
+log("DB", "Connecting to PostgreSQL...")
 conn = psycopg2.connect(DATABASE_URL, sslmode="require")
 conn.autocommit = True
-cur = conn.cursor()
+cur  = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+log("DB", "Connected to PostgreSQL successfully.")
 
+# Create & migrate table
 cur.execute("""
-CREATE TABLE IF NOT EXISTS infractions (
-    id SERIAL PRIMARY KEY
-);
+    CREATE TABLE IF NOT EXISTS infractions (
+        id           SERIAL PRIMARY KEY,
+        guild_id     BIGINT,
+        user_id      BIGINT,
+        moderator_id BIGINT,
+        reason       TEXT,
+        timestamp    TIMESTAMP DEFAULT NOW()
+    )
 """)
 
-cur.execute("""
-ALTER TABLE infractions
-    ADD COLUMN IF NOT EXISTS guild_id BIGINT,
-    ADD COLUMN IF NOT EXISTS user_id BIGINT,
-    ADD COLUMN IF NOT EXISTS moderator_id BIGINT,
-    ADD COLUMN IF NOT EXISTS reason TEXT,
-    ADD COLUMN IF NOT EXISTS timestamp TIMESTAMP DEFAULT NOW();
-""")
+# Safe column-type migration (idempotent)
+for col in ("user_id", "guild_id", "moderator_id"):
+    try:
+        cur.execute(f"""
+            ALTER TABLE infractions
+                ALTER COLUMN {col} TYPE BIGINT USING {col}::bigint
+        """)
+    except Exception:
+        conn.rollback()
 
-cur.execute("""
-ALTER TABLE infractions
-    ALTER COLUMN user_id TYPE BIGINT USING user_id::bigint,
-    ALTER COLUMN guild_id TYPE BIGINT USING guild_id::bigint,
-    ALTER COLUMN moderator_id TYPE BIGINT USING moderator_id::bigint;
-""")
+log("DB", "Database schema ready.")
 
-# -----------------------------
-# BOT SETUP
-# -----------------------------
+# ──────────────────────────────────────────────
+#  BOT SETUP
+# ──────────────────────────────────────────────
 intents = discord.Intents.default()
-intents.members = True
+intents.members         = True
 intents.message_content = True
-intents.guilds = True
-intents.messages = True
+intents.guilds          = True
+intents.messages        = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-GREEN_CHECK = "✅"
-WIND_PHRASE = "It must’ve been the wind."
+# ──────────────────────────────────────────────
+#  READY
+# ──────────────────────────────────────────────
+@bot.event
+async def on_ready():
+    try:
+        synced = await bot.tree.sync()
+        await dlog("STARTUP", f"Bot online: {bot.user} — synced {len(synced)} command(s)")
+    except Exception as e:
+        log("STARTUP", f"Failed to sync commands: {e}")
 
-# -----------------------------
-# HELPERS
-# -----------------------------
-def green_embed(title: str, description: str = None):
-    return discord.Embed(
-        title=title,
-        description=description,
-        color=discord.Color.green()
-    )
-
-def red_embed(title: str, description: str = None):
-    return discord.Embed(
-        title=title,
-        description=description,
-        color=discord.Color.red()
-    )
-
-async def send_log(title: str, description: str = None):
-    channel = bot.get_channel(LOG_CHANNEL_ID)
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(LOG_CHANNEL_ID)
-        except:
-            return
-    await channel.send(embed=green_embed(title, description))
-
-# -----------------------------
-# AUTO-ROLES + JOIN LOGGING
-# -----------------------------
+# ──────────────────────────────────────────────
+#  AUTO-ROLES + JOIN LOGGING
+# ──────────────────────────────────────────────
 @bot.event
 async def on_member_join(member: discord.Member):
+    await dlog("MEMBER", f"{member} ({member.id}) joined '{member.guild.name}'")
 
-    # Auto roles
     role1 = member.guild.get_role(AUTO_ROLE_1)
     role2 = member.guild.get_role(AUTO_ROLE_2)
-
     try:
-        if role1:
-            await member.add_roles(role1)
-        if role2:
-            await member.add_roles(role2)
-    except:
-        pass
+        roles_to_add = [r for r in (role1, role2) if r]
+        if roles_to_add:
+            await member.add_roles(*roles_to_add, reason="Auto-role on join")
+            await dlog("AUTO-ROLE", f"Assigned {len(roles_to_add)} auto-role(s) to {member}")
+    except Exception as e:
+        await dlog("AUTO-ROLE", f"Failed to assign auto-roles to {member}: {e}")
 
-    # Log join
     await send_log(
-        "Member Joined",
-        f"**User:** {member} ({member.id})\n"
-        f"**Server:** {member.guild.name}"
+        "📥 Member Joined",
+        f"**User:** {member} (`{member.id}`)\n"
+        f"**Account Created:** <t:{int(member.created_at.timestamp())}:R>\n"
+        f"**Server:** {member.guild.name}",
+        colour=discord.Color.green(),
     )
-# -----------------------------
+
+# ──────────────────────────────────────────────
+#  SLASH COMMANDS
+# ──────────────────────────────────────────────
+
 # /WARN
-# -----------------------------
 @bot.tree.command(name="warn", description="Warn a user and save it to the database")
+@app_commands.describe(user="User to warn", reason="Reason for the warning")
 @app_commands.checks.has_permissions(manage_messages=True)
 async def warn(interaction: discord.Interaction, user: discord.Member, reason: str):
+    await interaction.response.defer(ephemeral=True)
 
-    with conn.cursor() as c:
-        c.execute(
-            "INSERT INTO infractions (guild_id, user_id, moderator_id, reason) VALUES (%s, %s, %s, %s)",
-            (interaction.guild.id, user.id, interaction.user.id, reason)
-        )
-
-    dm_embed = red_embed(
-        "Roommates",
-        f"You were warned in Roommates for **{reason}**"
+    cur.execute(
+        "INSERT INTO infractions (guild_id, user_id, moderator_id, reason) VALUES (%s, %s, %s, %s) RETURNING id",
+        (interaction.guild.id, user.id, interaction.user.id, reason),
     )
+    infraction_id = cur.fetchone()[0]
 
     try:
-        await user.send(embed=dm_embed)
-    except:
+        await user.send(embed=red_embed("⚠️ You have been warned", f"**Server:** {interaction.guild.name}\n**Reason:** {reason}"))
+    except Exception:
         pass
 
-    embed = green_embed(
-        f"{GREEN_CHECK} {user.name} has been warned."
+    await interaction.followup.send(
+        embed=green_embed(f"{GREEN_CHECK} {user.display_name} has been warned.", f"Infraction ID: `{infraction_id}`")
     )
-    await interaction.response.send_message(embed=embed)
-
     await send_log(
-        "User Warned",
-        f"**User:** {user} ({user.id})\n"
-        f"**Moderator:** {interaction.user} ({interaction.user.id})\n"
-        f"**Reason:** {reason}"
+        "⚠️ User Warned",
+        f"**User:** {user} (`{user.id}`)\n"
+        f"**Moderator:** {interaction.user} (`{interaction.user.id}`)\n"
+        f"**Reason:** {reason}\n"
+        f"**Infraction ID:** `{infraction_id}`",
+        colour=discord.Color.yellow(),
     )
+    await dlog("WARN", f"{interaction.user} warned {user} (ID {infraction_id}): {reason}")
 
-# -----------------------------
 # /UNWARN
-# -----------------------------
 @bot.tree.command(name="unwarn", description="Remove the latest or a specific warning")
+@app_commands.describe(user="User to unwarn", infraction_id="Specific infraction ID (optional)")
 @app_commands.checks.has_permissions(manage_messages=True)
 async def unwarn(interaction: discord.Interaction, user: discord.Member, infraction_id: int = None):
+    await interaction.response.defer(ephemeral=True)
 
     if infraction_id:
-        with conn.cursor() as c:
-            c.execute(
-                "DELETE FROM infractions WHERE id = %s AND user_id = %s AND guild_id = %s RETURNING id",
-                (infraction_id, user.id, interaction.guild.id)
-            )
-            deleted = c.fetchone()
+        cur.execute(
+            "DELETE FROM infractions WHERE id = %s AND user_id = %s AND guild_id = %s RETURNING id",
+            (infraction_id, user.id, interaction.guild.id),
+        )
+        deleted = cur.fetchone()
 
         if deleted:
-            embed = green_embed(
-                f"{GREEN_CHECK} Warning removed.",
-                f"Removed infraction ID **{infraction_id}** for **{user.name}**."
+            await interaction.followup.send(
+                embed=green_embed(f"{GREEN_CHECK} Warning removed.", f"Removed infraction ID `{infraction_id}` for **{user.display_name}**.")
             )
             await send_log(
-                "Warning Removed",
-                f"**User:** {user} ({user.id})\n"
-                f"**Moderator:** {interaction.user} ({interaction.user.id})\n"
-                f"**Infraction ID:** {infraction_id}"
+                "🗑️ Warning Removed",
+                f"**User:** {user} (`{user.id}`)\n"
+                f"**Moderator:** {interaction.user} (`{interaction.user.id}`)\n"
+                f"**Infraction ID:** `{infraction_id}`",
+                colour=discord.Color.blue(),
             )
+            await dlog("UNWARN", f"{interaction.user} removed infraction {infraction_id} from {user}")
         else:
-            embed = green_embed(
-                "⚠️ No matching infraction found.",
-                "That infraction ID does not exist for this user."
+            await interaction.followup.send(
+                embed=orange_embed("⚠️ Not found.", f"Infraction ID `{infraction_id}` does not exist for **{user.display_name}**.")
             )
+        return
 
-        return await interaction.response.send_message(embed=embed)
-
-    with conn.cursor() as c:
-        c.execute(
-            "SELECT id FROM infractions WHERE user_id = %s AND guild_id = %s ORDER BY id DESC LIMIT 1",
-            (user.id, interaction.guild.id)
-        )
-        row = c.fetchone()
+    # Remove latest warning
+    cur.execute(
+        "SELECT id FROM infractions WHERE user_id = %s AND guild_id = %s ORDER BY id DESC LIMIT 1",
+        (user.id, interaction.guild.id),
+    )
+    row = cur.fetchone()
 
     if not row:
-        return await interaction.response.send_message(
-            embed=green_embed("⚠️ No warnings found.", f"{user.name} has no warnings.")
+        await interaction.followup.send(
+            embed=orange_embed("⚠️ No warnings found.", f"**{user.display_name}** has no infractions.")
         )
+        return
 
     latest_id = row[0]
+    cur.execute("DELETE FROM infractions WHERE id = %s", (latest_id,))
 
-    with conn.cursor() as c:
-        c.execute("DELETE FROM infractions WHERE id = %s", (latest_id,))
-
-    embed = green_embed(
-        f"{GREEN_CHECK} Latest warning removed.",
-        f"Removed infraction ID **{latest_id}** for **{user.name}**."
+    await interaction.followup.send(
+        embed=green_embed(f"{GREEN_CHECK} Latest warning removed.", f"Removed infraction ID `{latest_id}` for **{user.display_name}**.")
     )
-    await interaction.response.send_message(embed=embed)
-
     await send_log(
-        "Latest Warning Removed",
-        f"**User:** {user} ({user.id})\n"
-        f"**Moderator:** {interaction.user} ({interaction.user.id})\n"
-        f"**Infraction ID:** {latest_id}"
+        "🗑️ Latest Warning Removed",
+        f"**User:** {user} (`{user.id}`)\n"
+        f"**Moderator:** {interaction.user} (`{interaction.user.id}`)\n"
+        f"**Infraction ID:** `{latest_id}`",
+        colour=discord.Color.blue(),
     )
+    await dlog("UNWARN", f"{interaction.user} removed latest infraction {latest_id} from {user}")
 
-# -----------------------------
 # /KICK
-# -----------------------------
 @bot.tree.command(name="kick", description="Kick a user from the server")
+@app_commands.describe(user="User to kick", reason="Reason for the kick")
 @app_commands.checks.has_permissions(kick_members=True)
 async def kick(interaction: discord.Interaction, user: discord.Member, reason: str):
+    await interaction.response.defer(ephemeral=True)
+
+    if user.top_role >= interaction.guild.me.top_role:
+        await interaction.followup.send(
+            embed=red_embed("❌ Cannot kick", "That user's role is equal to or higher than mine.")
+        )
+        return
+
+    try:
+        await user.send(embed=red_embed("🦵 You have been kicked", f"**Server:** {interaction.guild.name}\n**Reason:** {reason}"))
+    except Exception:
+        pass
+
+    try:
+        await user.kick(reason=reason)
+    except discord.Forbidden:
+        await interaction.followup.send(embed=red_embed("❌ Missing Permissions", "I don't have permission to kick that user."))
+        return
+    except Exception as e:
+        await interaction.followup.send(embed=red_embed("❌ Error", f"Failed to kick user: {e}"))
+        return
+
+    await interaction.followup.send(
+        embed=green_embed(f"{GREEN_CHECK} {user.display_name} has been kicked.", WIND_PHRASE)
+    )
+    await send_log(
+        "🦵 User Kicked",
+        f"**User:** {user} (`{user.id}`)\n"
+        f"**Moderator:** {interaction.user} (`{interaction.user.id}`)\n"
+        f"**Reason:** {reason}",
+        colour=discord.Color.orange(),
+    )
+    await dlog("KICK", f"{interaction.user} kicked {user}: {reason}")
+
+# /BAN
+@bot.tree.command(name="ban", description="Ban a user from the server")
+@app_commands.describe(user="User to ban", reason="Reason for the ban")
+@app_commands.checks.has_permissions(ban_members=True)
+async def ban(interaction: discord.Interaction, user: discord.Member, reason: str):
+    await interaction.response.defer(ephemeral=True)
+
+    if user.top_role >= interaction.guild.me.top_role:
+        await interaction.followup.send(
+            embed=red_embed("❌ Cannot ban", "That user's role is equal to or higher than mine.")
+        )
+        return
+
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(label="Appeal Here", url="https://discord.gg/HDwzGxfKQ8"))
 
     try:
         await user.send(
-            embed=red_embed(
-                "Roommates",
-                f"You were kicked in Roommates for **{reason}**"
-            )
+            embed=red_embed("🔨 You have been banned", f"**Server:** {interaction.guild.name}\n**Reason:** {reason}"),
+            view=view,
         )
-    except:
+    except Exception:
         pass
-
-    await user.kick(reason=reason)
-
-    embed = green_embed(
-        f"{GREEN_CHECK} {user.name} has been kicked.",
-        WIND_PHRASE
-    )
-    await interaction.response.send_message(embed=embed)
-
-    await send_log(
-        "User Kicked",
-        f"**User:** {user} ({user.id})\n"
-        f"**Moderator:** {interaction.user} ({interaction.user.id})\n"
-        f"**Reason:** {reason}"
-    )
-
-# -----------------------------
-# /BAN
-# -----------------------------
-@bot.tree.command(name="ban", description="Ban a user from the server")
-@app_commands.checks.has_permissions(ban_members=True)
-async def ban(interaction: discord.Interaction, user: discord.Member, reason: str):
-
-    dm_embed = red_embed(
-        "Roommates",
-        f"You were banned in Roommates for **{reason}**"
-    )
-
-    view = discord.ui.View()
-    view.add_item(discord.ui.Button(
-        label="Appeal Here",
-        url="https://discord.gg/HDwzGxfKQ8"
-    ))
 
     try:
-        await user.send(embed=dm_embed, view=view)
-    except:
-        pass
+        await user.ban(reason=reason, delete_message_days=0)
+    except discord.Forbidden:
+        await interaction.followup.send(embed=red_embed("❌ Missing Permissions", "I don't have permission to ban that user."))
+        return
+    except Exception as e:
+        await interaction.followup.send(embed=red_embed("❌ Error", f"Failed to ban user: {e}"))
+        return
 
-    await user.ban(reason=reason)
-
-    embed = green_embed(
-        WIND_PHRASE
-    )
-    await interaction.response.send_message(embed=embed)
-
+    await interaction.followup.send(embed=green_embed(WIND_PHRASE))
     await send_log(
-        "User Banned",
-        f"**User:** {user} ({user.id})\n"
-        f"**Moderator:** {interaction.user} ({interaction.user.id})\n"
-        f"**Reason:** {reason}"
+        "🔨 User Banned",
+        f"**User:** {user} (`{user.id}`)\n"
+        f"**Moderator:** {interaction.user} (`{interaction.user.id}`)\n"
+        f"**Reason:** {reason}",
+        colour=discord.Color.red(),
     )
+    await dlog("BAN", f"{interaction.user} banned {user}: {reason}")
 
-# -----------------------------
 # /UNBAN
-# -----------------------------
 @bot.tree.command(name="unban", description="Unban a user from the server")
+@app_commands.describe(user_id="The Discord ID of the user to unban")
 @app_commands.checks.has_permissions(ban_members=True)
 async def unban(interaction: discord.Interaction, user_id: str):
+    await interaction.response.defer(ephemeral=True)
 
     try:
-        user_id_int = int(user_id)
+        uid = int(user_id)
     except ValueError:
-        return await interaction.response.send_message(
-            embed=green_embed("Invalid ID", "User ID must be a number.")
-        )
+        await interaction.followup.send(embed=red_embed("❌ Invalid ID", "User ID must be a number."))
+        return
 
     try:
-        user = await bot.fetch_user(user_id_int)
-    except:
-        return await interaction.response.send_message(
-            embed=green_embed("User Not Found", "Discord could not find a user with that ID.")
-        )
-
-    try:
-        await interaction.guild.unban(user)
+        user = await bot.fetch_user(uid)
     except discord.NotFound:
-        return await interaction.response.send_message(
-            embed=green_embed("Not Banned", "This user is not banned from the server.")
-        )
+        await interaction.followup.send(embed=red_embed("❌ User Not Found", "No Discord user found with that ID."))
+        return
+    except Exception as e:
+        await interaction.followup.send(embed=red_embed("❌ Error", f"Could not fetch user: {e}"))
+        return
+
+    try:
+        await interaction.guild.unban(user, reason=f"Unbanned by {interaction.user}")
+    except discord.NotFound:
+        await interaction.followup.send(embed=orange_embed("⚠️ Not Banned", "This user is not banned from the server."))
+        return
     except discord.Forbidden:
-        return await interaction.response.send_message(
-            embed=green_embed("Missing Permissions", "I do not have permission to unban this user.")
-        )
+        await interaction.followup.send(embed=red_embed("❌ Missing Permissions", "I don't have permission to unban this user."))
+        return
 
-    embed = green_embed(
-        f"{GREEN_CHECK} User Unbanned",
-        f"{user} has been unbanned."
+    await interaction.followup.send(
+        embed=green_embed(f"{GREEN_CHECK} User Unbanned", f"**{user}** has been unbanned.")
     )
-    await interaction.response.send_message(embed=embed)
-
     await send_log(
-        "User Unbanned",
-        f"**User:** {user} ({user.id})\n"
-        f"**Moderator:** {interaction.user} ({interaction.user.id})"
+        "✅ User Unbanned",
+        f"**User:** {user} (`{user.id}`)\n"
+        f"**Moderator:** {interaction.user} (`{interaction.user.id}`)",
+        colour=discord.Color.green(),
     )
+    await dlog("UNBAN", f"{interaction.user} unbanned {user} ({uid})")
 
-# -----------------------------
 # /INFRACTIONS
-# -----------------------------
 @bot.tree.command(name="infractions", description="View a user's warnings")
+@app_commands.describe(user="User to look up")
 async def infractions(interaction: discord.Interaction, user: discord.Member):
+    await interaction.response.defer(ephemeral=True)
 
-    with conn.cursor() as c:
-        c.execute(
-            """
-            SELECT id, reason, timestamp, moderator_id
-            FROM infractions
-            WHERE user_id = %s AND guild_id = %s
-            ORDER BY timestamp DESC
-            """,
-            (user.id, interaction.guild.id)
-        )
-        rows = c.fetchall()
+    cur.execute(
+        """
+        SELECT id, reason, timestamp, moderator_id
+        FROM infractions
+        WHERE user_id = %s AND guild_id = %s
+        ORDER BY timestamp DESC
+        """,
+        (user.id, interaction.guild.id),
+    )
+    rows = cur.fetchall()
 
     if not rows:
-        return await interaction.response.send_message(
-            embed=green_embed("No warnings found.", f"{user.name} has no infractions.")
+        await interaction.followup.send(
+            embed=green_embed("No infractions found.", f"**{user.display_name}** has a clean record.")
         )
+        return
 
     desc = ""
-    for inf in rows:
-        inf_id, reason, ts, mod_id = inf
+    for row in rows:
+        inf_id, reason, ts, mod_id = row[0], row[1], row[2], row[3]
         try:
-            unix_ts = int(ts.timestamp())
-            time_str = f"<t:{unix_ts}:R>"
-        except:
+            time_str = f"<t:{int(ts.timestamp())}:R>"
+        except Exception:
             time_str = str(ts)
-
         desc += (
-            f"**ID {inf_id}** — {reason}\n"
+            f"**ID `{inf_id}`** — {reason}\n"
             f"**Moderator:** <@{mod_id}> • {time_str}\n\n"
         )
 
-    embed = green_embed(f"Infractions for {user.name}", desc)
-    await interaction.response.send_message(embed=embed)
+    embed = green_embed(f"Infractions for {user.display_name} ({len(rows)} total)", desc)
+    embed.set_thumbnail(url=user.display_avatar.url)
+    await interaction.followup.send(embed=embed)
 
-# -----------------------------
 # /CLEARINFRACTIONS
-# -----------------------------
 @bot.tree.command(name="clearinfractions", description="Clear all warnings for a user")
+@app_commands.describe(user="User whose infractions to clear")
 @app_commands.checks.has_permissions(manage_messages=True)
 async def clearinfractions(interaction: discord.Interaction, user: discord.Member):
+    await interaction.response.defer(ephemeral=True)
 
-    with conn.cursor() as c:
-        c.execute(
-            "DELETE FROM infractions WHERE user_id = %s AND guild_id = %s",
-            (user.id, interaction.guild.id)
-        )
-
-    embed = green_embed(
-        f"{GREEN_CHECK} Infractions cleared.",
-        f"All warnings for **{user.name}** have been removed."
+    cur.execute(
+        "DELETE FROM infractions WHERE user_id = %s AND guild_id = %s",
+        (user.id, interaction.guild.id),
     )
-    await interaction.response.send_message(embed=embed)
 
+    await interaction.followup.send(
+        embed=green_embed(f"{GREEN_CHECK} Infractions cleared.", f"All warnings for **{user.display_name}** have been removed.")
+    )
     await send_log(
-        "Infractions Cleared",
-        f"**User:** {user} ({user.id})\n"
-        f"**Moderator:** {interaction.user} ({interaction.user.id})"
+        "🗑️ Infractions Cleared",
+        f"**User:** {user} (`{user.id}`)\n"
+        f"**Moderator:** {interaction.user} (`{interaction.user.id}`)",
+        colour=discord.Color.blue(),
     )
-# -----------------------------
-# LOGGING EVENTS
-# -----------------------------
+    await dlog("CLEAR-INF", f"{interaction.user} cleared all infractions for {user}")
+
+# /TIMEOUT
+@bot.tree.command(name="timeout", description="Timeout a user")
+@app_commands.describe(user="User to timeout", minutes="Duration in minutes", reason="Reason")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def timeout_cmd(interaction: discord.Interaction, user: discord.Member, minutes: int, reason: str = "No reason provided"):
+    await interaction.response.defer(ephemeral=True)
+
+    if minutes < 1 or minutes > 40320:
+        await interaction.followup.send(embed=red_embed("❌ Invalid duration", "Duration must be between 1 and 40320 minutes (28 days)."))
+        return
+
+    from datetime import timedelta, timezone
+    until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+
+    try:
+        await user.timeout(until, reason=reason)
+    except discord.Forbidden:
+        await interaction.followup.send(embed=red_embed("❌ Missing Permissions", "I can't timeout that user."))
+        return
+    except Exception as e:
+        await interaction.followup.send(embed=red_embed("❌ Error", str(e)))
+        return
+
+    await interaction.followup.send(
+        embed=green_embed(f"{GREEN_CHECK} {user.display_name} timed out.", f"Duration: **{minutes} minute(s)**\nReason: {reason}")
+    )
+    await send_log(
+        "🔇 User Timed Out",
+        f"**User:** {user} (`{user.id}`)\n"
+        f"**Moderator:** {interaction.user} (`{interaction.user.id}`)\n"
+        f"**Duration:** {minutes} minute(s)\n"
+        f"**Until:** <t:{int(until.timestamp())}:R>\n"
+        f"**Reason:** {reason}",
+        colour=discord.Color.orange(),
+    )
+    await dlog("TIMEOUT", f"{interaction.user} timed out {user} for {minutes}m: {reason}")
+
+# /UNTIMEOUT
+@bot.tree.command(name="untimeout", description="Remove a timeout from a user")
+@app_commands.describe(user="User to untimeout")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def untimeout_cmd(interaction: discord.Interaction, user: discord.Member):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        await user.timeout(None)
+    except discord.Forbidden:
+        await interaction.followup.send(embed=red_embed("❌ Missing Permissions", "I can't remove that user's timeout."))
+        return
+    except Exception as e:
+        await interaction.followup.send(embed=red_embed("❌ Error", str(e)))
+        return
+
+    await interaction.followup.send(
+        embed=green_embed(f"{GREEN_CHECK} Timeout removed for {user.display_name}.")
+    )
+    await send_log(
+        "🔊 Timeout Removed",
+        f"**User:** {user} (`{user.id}`)\n"
+        f"**Moderator:** {interaction.user} (`{interaction.user.id}`)",
+        colour=discord.Color.green(),
+    )
+    await dlog("UNTIMEOUT", f"{interaction.user} removed timeout from {user}")
+
+# ──────────────────────────────────────────────
+#  SERVER / MOD LOG EVENTS
+# ──────────────────────────────────────────────
 @bot.event
 async def on_member_remove(member: discord.Member):
+    await dlog("MEMBER", f"{member} ({member.id}) left '{member.guild.name}'")
     await send_log(
-        "Member Left",
-        f"**User:** {member} ({member.id})\n"
-        f"**Server:** {member.guild.name}"
+        "📤 Member Left",
+        f"**User:** {member} (`{member.id}`)\n"
+        f"**Server:** {member.guild.name}",
+        colour=discord.Color.red(),
     )
 
 @bot.event
 async def on_message_delete(message: discord.Message):
     if message.author.bot:
         return
-    content = message.content or "*No content*"
+    content = message.content or "*No content (embed or attachment)*"
     await send_log(
-        "Message Deleted",
-        f"**Author:** {message.author} ({message.author.id})\n"
+        "🗑️ Message Deleted",
+        f"**Author:** {message.author} (`{message.author.id}`)\n"
         f"**Channel:** {message.channel.mention}\n"
-        f"**Content:** {content}"
+        f"**Content:** {content[:1000]}",
+        colour=discord.Color.red(),
     )
 
 @bot.event
@@ -412,84 +525,147 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
         return
     if before.content == after.content:
         return
-
     before_content = before.content or "*No content*"
-    after_content = after.content or "*No content*"
-
+    after_content  = after.content  or "*No content*"
     await send_log(
-        "Message Edited",
-        f"**Author:** {before.author} ({before.author.id})\n"
+        "✏️ Message Edited",
+        f"**Author:** {before.author} (`{before.author.id}`)\n"
         f"**Channel:** {before.channel.mention}\n"
-        f"**Before:** {before_content}\n"
-        f"**After:** {after_content}"
+        f"**Before:** {before_content[:500]}\n"
+        f"**After:** {after_content[:500]}",
+        colour=discord.Color.yellow(),
     )
 
 @bot.event
 async def on_guild_channel_create(channel: discord.abc.GuildChannel):
+    mention = channel.mention if isinstance(channel, discord.TextChannel) else channel.name
     await send_log(
-        "Channel Created",
-        f"**Channel:** {channel.mention if isinstance(channel, discord.TextChannel) else channel.name}\n"
-        f"**ID:** {channel.id}\n"
-        f"**Server:** {channel.guild.name}"
+        "📢 Channel Created",
+        f"**Channel:** {mention} (`{channel.id}`)\n"
+        f"**Type:** {type(channel).__name__}\n"
+        f"**Server:** {channel.guild.name}",
+        colour=discord.Color.green(),
     )
+    await dlog("CHANNEL", f"Channel created: #{channel.name} ({channel.id}) in '{channel.guild.name}'")
 
 @bot.event
 async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
     await send_log(
-        "Channel Deleted",
-        f"**Channel:** {channel.name}\n"
-        f"**ID:** {channel.id}\n"
-        f"**Server:** {channel.guild.name}"
+        "🗑️ Channel Deleted",
+        f"**Channel:** #{channel.name} (`{channel.id}`)\n"
+        f"**Type:** {type(channel).__name__}\n"
+        f"**Server:** {channel.guild.name}",
+        colour=discord.Color.red(),
+    )
+    await dlog("CHANNEL", f"Channel deleted: #{channel.name} ({channel.id}) in '{channel.guild.name}'")
+
+@bot.event
+async def on_guild_role_create(role: discord.Role):
+    await send_log(
+        "🔖 Role Created",
+        f"**Role:** {role.name} (`{role.id}`)\n"
+        f"**Server:** {role.guild.name}",
+        colour=discord.Color.green(),
     )
 
 @bot.event
-async def on_member_update(before: discord.Member, after: discord.Member):
-    # ---- TIMEOUT LOGGING (SAFE FOR YOUR LIB) ----
-    before_timeout = getattr(before, "timed_out_until", None)
-    after_timeout = getattr(after, "timed_out_until", None)
+async def on_guild_role_delete(role: discord.Role):
+    await send_log(
+        "🗑️ Role Deleted",
+        f"**Role:** {role.name} (`{role.id}`)\n"
+        f"**Server:** {role.guild.name}",
+        colour=discord.Color.red(),
+    )
 
-    if before_timeout != after_timeout:
-        await send_log(
-            "Timeout Updated",
-            f"**User:** {after} ({after.id})\n"
-            f"**Before:** {before_timeout}\n"
-            f"**After:** {after_timeout}"
-        )
-
-    # ---- ROLE CHANGES ----
-    before_roles = set(before.roles)
-    after_roles = set(after.roles)
-
-    added_roles = after_roles - before_roles
-    removed_roles = before_roles - after_roles
-
-    for role in added_roles:
-        if role.is_default():
-            continue
-        await send_log(
-            "Role Given",
-            f"**User:** {after} ({after.id})\n"
-            f"**Role:** {role.name} ({role.id})"
-        )
-
-    for role in removed_roles:
-        if role.is_default():
-            continue
-        await send_log(
-            "Role Removed",
-            f"**User:** {after} ({after.id})\n"
-            f"**Role:** {role.name} ({role.id})"
-        )
-
-# -----------------------------
-# READY
-# -----------------------------
 @bot.event
-async def on_ready():
-    await bot.tree.sync()
-    print(f"Logged in as {bot.user}")
+async def on_member_ban(guild: discord.Guild, user: discord.User):
+    await dlog("BAN-EVENT", f"{user} ({user.id}) was banned from '{guild.name}'")
 
-# -----------------------------
-# RUN
-# -----------------------------
+@bot.event
+async def on_member_unban(guild: discord.Guild, user: discord.User):
+    await dlog("UNBAN-EVENT", f"{user} ({user.id}) was unbanned from '{guild.name}'")
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    # Timeout changes
+    before_to = getattr(before, "timed_out_until", None)
+    after_to  = getattr(after,  "timed_out_until", None)
+
+    if before_to != after_to:
+        if after_to:
+            await send_log(
+                "🔇 Member Timed Out",
+                f"**User:** {after} (`{after.id}`)\n"
+                f"**Until:** <t:{int(after_to.timestamp())}:R>",
+                colour=discord.Color.orange(),
+            )
+        else:
+            await send_log(
+                "🔊 Timeout Lifted",
+                f"**User:** {after} (`{after.id}`)",
+                colour=discord.Color.green(),
+            )
+
+    # Role changes
+    added   = set(after.roles)  - set(before.roles)
+    removed = set(before.roles) - set(after.roles)
+
+    for role in added:
+        if role.is_default():
+            continue
+        await send_log(
+            "➕ Role Given",
+            f"**User:** {after} (`{after.id}`)\n"
+            f"**Role:** {role.name} (`{role.id}`)",
+            colour=discord.Color.green(),
+        )
+
+    for role in removed:
+        if role.is_default():
+            continue
+        await send_log(
+            "➖ Role Removed",
+            f"**User:** {after} (`{after.id}`)\n"
+            f"**Role:** {role.name} (`{role.id}`)",
+            colour=discord.Color.orange(),
+        )
+
+    # Nickname changes
+    if before.nick != after.nick:
+        await send_log(
+            "📝 Nickname Changed",
+            f"**User:** {after} (`{after.id}`)\n"
+            f"**Before:** {before.nick or '*None*'}\n"
+            f"**After:** {after.nick or '*None*'}",
+            colour=discord.Color.blurple(),
+        )
+
+# ──────────────────────────────────────────────
+#  ERROR HANDLER
+# ──────────────────────────────────────────────
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    msg = "An unexpected error occurred."
+
+    if isinstance(error, app_commands.MissingPermissions):
+        msg = "You don't have permission to use this command."
+    elif isinstance(error, app_commands.BotMissingPermissions):
+        msg = "I'm missing permissions to do that."
+    elif isinstance(error, app_commands.CommandOnCooldown):
+        msg = f"You're on cooldown. Try again in {error.retry_after:.1f}s."
+
+    await dlog("CMD-ERROR", f"/{interaction.command.name if interaction.command else '?'} by {interaction.user}: {error}")
+
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=red_embed("❌ Error", msg), ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=red_embed("❌ Error", msg), ephemeral=True)
+    except Exception:
+        pass
+
+# ──────────────────────────────────────────────
+#  ENTRY POINT
+# ──────────────────────────────────────────────
+log("STARTUP", "Starting bot...")
 bot.run(TOKEN)
