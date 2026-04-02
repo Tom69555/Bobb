@@ -1,10 +1,11 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 import psycopg2
 import psycopg2.extras
 import os
 import asyncio
+import aiohttp
 from datetime import datetime
 
 # ──────────────────────────────────────────────
@@ -21,6 +22,13 @@ AUTO_ROLE_2 = 1485452341200289975
 
 GREEN_CHECK  = "✅"
 WIND_PHRASE  = "It must've been the wind."
+
+# ──────────────────────────────────────────────
+#  CCU TRACKER CONFIG
+# ──────────────────────────────────────────────
+CCU_CHANNEL_ID     = 1489339616703156396
+ROBLOX_UNIVERSE_ID = 9798063312   # game universe ID
+CCU_UPDATE_INTERVAL = 60          # seconds
 
 # ──────────────────────────────────────────────
 #  LOGGING HELPERS
@@ -120,6 +128,33 @@ for col in ("user_id", "guild_id", "moderator_id"):
 
 log("DB", "Database schema ready.")
 
+# ── CCU peak helpers ────────────────────────────
+cur.execute("""
+    CREATE TABLE IF NOT EXISTS ccu_stats (
+        key   TEXT PRIMARY KEY,
+        value INTEGER NOT NULL DEFAULT 0
+    )
+""")
+# Seed the peak row if it doesn't exist yet
+cur.execute("""
+    INSERT INTO ccu_stats (key, value)
+    VALUES ('peak', 0)
+    ON CONFLICT (key) DO NOTHING
+""")
+log("DB", "CCU stats table ready.")
+
+def db_get_peak() -> int:
+    cur.execute("SELECT value FROM ccu_stats WHERE key = 'peak'")
+    row = cur.fetchone()
+    return row[0] if row else 0
+
+def db_set_peak(value: int):
+    cur.execute("""
+        INSERT INTO ccu_stats (key, value)
+        VALUES ('peak', %s)
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+    """, (value,))
+
 # ──────────────────────────────────────────────
 #  BOT SETUP
 # ──────────────────────────────────────────────
@@ -141,6 +176,10 @@ async def on_ready():
         await dlog("STARTUP", f"Bot online: {bot.user} — synced {len(synced)} command(s)")
     except Exception as e:
         log("STARTUP", f"Failed to sync commands: {e}")
+
+    if not update_ccu.is_running():
+        update_ccu.start()
+        log("CCU", f"CCU tracker started for universe {ROBLOX_UNIVERSE_ID}")
 
 # ──────────────────────────────────────────────
 #  AUTO-ROLES + JOIN LOGGING
@@ -662,6 +701,87 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         )
 
 # ──────────────────────────────────────────────
+#  CCU TRACKER
+# ──────────────────────────────────────────────
+async def fetch_roblox_ccu(universe_id: int) -> int | None:
+    """Fetch live player count from Roblox Games API."""
+    url = f"https://games.roblox.com/v1/games?universeIds={universe_id}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    log("CCU", f"Roblox API returned HTTP {resp.status}")
+                    return None
+                data = await resp.json()
+                games = data.get("data", [])
+                if not games:
+                    log("CCU", "No game data returned from Roblox API")
+                    return None
+                return games[0].get("playing", 0)
+    except Exception as e:
+        log("CCU", f"Error fetching CCU: {e}")
+        return None
+
+@tasks.loop(seconds=CCU_UPDATE_INTERVAL)
+async def update_ccu():
+    await bot.wait_until_ready()
+
+    channel = bot.get_channel(CCU_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(CCU_CHANNEL_ID)
+        except Exception as e:
+            log("CCU", f"Could not fetch CCU channel: {e}")
+            return
+
+    ccu = await fetch_roblox_ccu(ROBLOX_UNIVERSE_ID)
+    if ccu is None:
+        log("CCU", "Skipping update — could not retrieve CCU.")
+        return
+
+    new_name = f"🎮 RoomMates | {ccu} online"
+
+    # Only rename if it changed (Discord rate-limits channel renames to 2/10min)
+    if channel.name != new_name:
+        try:
+            await channel.edit(name=new_name)
+            log("CCU", f"Channel updated → '{new_name}'")
+        except discord.RateLimited as e:
+            log("CCU", f"Rate limited on channel rename — retry in {e.retry_after:.0f}s")
+        except Exception as e:
+            log("CCU", f"Failed to rename channel: {e}")
+
+    # Check for new all-time peak (read from and write to DB)
+    try:
+        current_peak = db_get_peak()
+    except Exception as e:
+        log("CCU", f"Failed to read peak from DB: {e}")
+        return
+
+    if ccu > current_peak:
+        try:
+            db_set_peak(ccu)
+        except Exception as e:
+            log("CCU", f"Failed to write new peak to DB: {e}")
+            return
+
+        log("CCU", f"New peak CCU! {current_peak} → {ccu} (saved to DB)")
+        try:
+            embed = discord.Embed(
+                title="🏆 New Peak CCU!",
+                description=(
+                    f"**{ccu} players** are currently online — a new all-time record!\n"
+                    f"Previous peak: **{current_peak}**"
+                ),
+                color=discord.Color.gold(),
+            )
+            embed.timestamp = datetime.utcnow()
+            await safe_send(channel.send(content="@here", embed=embed))
+            await dlog("CCU", f"New peak CCU reached: {ccu} (was {current_peak}) — saved to DB")
+        except Exception as e:
+            log("CCU", f"Failed to send peak CCU message: {e}")
+
+# ──────────────────────────────────────────────
 #  ERROR HANDLER
 # ──────────────────────────────────────────────
 @bot.tree.error
@@ -690,4 +810,3 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 # ──────────────────────────────────────────────
 log("STARTUP", "Starting bot...")
 bot.run(TOKEN)
-
