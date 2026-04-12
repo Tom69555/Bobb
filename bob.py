@@ -780,7 +780,6 @@ def build_ccu_embed(data, peak):
     return embed
 
 @tasks.loop(seconds=CCU_UPDATE_INTERVAL)
-@tasks.loop(seconds=CCU_UPDATE_INTERVAL)
 async def update_ccu():
     global ccu_message_id
     await bot.wait_until_ready()
@@ -855,68 +854,6 @@ async def update_ccu():
             await ghost.delete()
         except Exception as e:
             log("CCU", f"Ghost ping failed: {e}")
-
-data = await fetch_roblox_game_data(ROBLOX_UNIVERSE_ID)
-
-if not data:
-    log("CCU", "Failed to fetch game data")
-    return
-
-    try:
-        current_peak = db_get_peak()
-    except Exception as e:
-        log("CCU", f"Failed to read peak from DB: {e}")
-        return
-
-    new_peak = ccu > current_peak
-    if new_peak:
-        try:
-            db_set_peak(ccu)
-            current_peak = ccu
-            log("CCU", f"New peak saved to DB: {ccu}")
-        except Exception as e:
-            log("CCU", f"Failed to write new peak to DB: {e}")
-            return
-view = discord.ui.View()
-view.add_item(
-    discord.ui.Button(
-        label="▶️ Join Game",
-        url=f"https://www.roblox.com/games/{data['place_id']}"
-    )
-)
-embed = build_ccu_embed(data, current_peak)
-
-    # Try to edit the existing embed message
-    if ccu_message_id:
-        try:
-            msg = await channel.fetch_message(ccu_message_id)
-await msg.edit(embed=embed, view=view)
-            log("CCU", f"Embed updated — CCU: {ccu}, Peak: {current_peak}")
-        except discord.NotFound:
-            ccu_message_id = None  # message was deleted, send a new one
-        except Exception as e:
-            log("CCU", f"Failed to edit CCU embed: {e}")
-            return
-
-    # Send a fresh embed if we don't have one yet (first run or message was deleted)
-    if not ccu_message_id:
-        try:
-            msg = await safe_send(channel.send(embed=embed))
-            if msg:
-                ccu_message_id = msg.id
-                log("CCU", f"CCU embed posted (message ID: {msg.id})")
-        except Exception as e:
-            log("CCU", f"Failed to send CCU embed: {e}")
-            return
-
-    # Ghost ping @here on new peak
-    if new_peak:
-        try:
-            ghost = await channel.send("@here")
-            await ghost.delete()
-            await dlog("CCU", f"New peak CCU: {ccu} — ghost ping sent, DB updated")
-        except Exception as e:
-            log("CCU", f"Failed to send ghost ping: {e}")
 
 # ──────────────────────────────────────────────
 #  ERROR HANDLER
