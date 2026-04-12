@@ -27,7 +27,7 @@ WIND_PHRASE  = "It must've been the wind."
 #  CCU TRACKER CONFIG
 # ──────────────────────────────────────────────
 CCU_CHANNEL_ID     = 1489339616703156396
-ROBLOX_UNIVERSE_ID = 9798063312   # game universe ID
+ROBLOX_UNIVERSE_ID = 7498491579   # game universe ID
 CCU_UPDATE_INTERVAL = 60          # seconds
 
 # ──────────────────────────────────────────────
@@ -703,39 +703,83 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 # ──────────────────────────────────────────────
 #  CCU TRACKER
 # ──────────────────────────────────────────────
-async def fetch_roblox_ccu(universe_id: int) -> int | None:
-    """Fetch live player count from Roblox Games API."""
+async def fetch_roblox_game_data(universe_id: int):
     url = f"https://games.roblox.com/v1/games?universeIds={universe_id}"
+
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+
+            async with session.get(url) as resp:
                 if resp.status != 200:
-                    log("CCU", f"Roblox API returned HTTP {resp.status}")
+                    log("CCU", f"API error {resp.status}")
                     return None
+
                 data = await resp.json()
-                games = data.get("data", [])
-                if not games:
-                    log("CCU", "No game data returned from Roblox API")
-                    return None
-                return games[0].get("playing", 0)
+                game = data["data"][0]
+
+                ccu = game["playing"]
+                name = game["name"]
+                visits = game.get("visits", 0)
+                place_id = game["rootPlaceId"]
+
+            # ICON
+            async with session.get(
+                f"https://thumbnails.roblox.com/v1/games/icons?universeIds={universe_id}&size=512x512&format=Png"
+            ) as r:
+                icon = None
+                if r.status == 200:
+                    t = await r.json()
+                    icon = t["data"][0]["imageUrl"]
+
+            # VOTES
+            async with session.get(
+                f"https://games.roblox.com/v1/games/votes?universeIds={universe_id}"
+            ) as r:
+                likes = 0
+                ratio = 0
+
+                if r.status == 200:
+                    v = await r.json()
+                    up = v["data"][0]["upVotes"]
+                    down = v["data"][0]["downVotes"]
+                    likes = up
+                    ratio = (up / (up + down) * 100) if (up + down) else 0
+
+            return {
+                "ccu": ccu,
+                "name": name,
+                "visits": visits,
+                "place_id": place_id,
+                "icon": icon,
+                "likes": likes,
+                "ratio": ratio
+            }
+
     except Exception as e:
-        log("CCU", f"Error fetching CCU: {e}")
+        log("CCU", f"Error: {e}")
         return None
 
 # Stores the message ID of the persistent CCU embed so we can edit it each tick
 ccu_message_id: int | None = None
 
-def build_ccu_embed(ccu: int, peak: int) -> discord.Embed:
+def build_ccu_embed(data, peak):
     embed = discord.Embed(
-        title="🎮 RoomMates — Live Players",
+        title=f"🎮 {data['name']} — Live Stats",
         color=discord.Color.from_rgb(255, 255, 255),
     )
-    embed.add_field(name="🟢 Current CCU", value=f"**{ccu}**", inline=True)
-    embed.add_field(name="🏆 Highest CCU", value=f"**{peak}**", inline=True)
-    embed.set_footer(text="Updates every minute")
+
+    embed.add_field(name="🟢 CCU", value=f"**{data['ccu']}**", inline=True)
+    embed.add_field(name="🏆 Peak", value=f"**{peak}**", inline=True)
+    embed.add_field(name="👍 Likes", value=f"**{data['likes']} ({data['ratio']:.1f}%)**", inline=True)
+    embed.add_field(name="👁 Visits", value=f"**{data['visits']:,}**", inline=True)
+
+    if data["icon"]:
+        embed.set_thumbnail(url=data["icon"])
+
     embed.timestamp = datetime.utcnow()
     return embed
 
+@tasks.loop(seconds=CCU_UPDATE_INTERVAL)
 @tasks.loop(seconds=CCU_UPDATE_INTERVAL)
 async def update_ccu():
     global ccu_message_id
@@ -749,10 +793,74 @@ async def update_ccu():
             log("CCU", f"Could not fetch CCU channel: {e}")
             return
 
-    ccu = await fetch_roblox_ccu(ROBLOX_UNIVERSE_ID)
-    if ccu is None:
-        log("CCU", "Skipping update — could not retrieve CCU.")
+    # fetch game data
+    data = await fetch_roblox_game_data(ROBLOX_UNIVERSE_ID)
+    if not data:
+        log("CCU", "Failed to fetch game data")
         return
+
+    # get peak
+    try:
+        current_peak = db_get_peak()
+    except Exception as e:
+        log("CCU", f"DB error: {e}")
+        return
+
+    new_peak = data["ccu"] > current_peak
+
+    if new_peak:
+        try:
+            db_set_peak(data["ccu"])
+            current_peak = data["ccu"]
+        except Exception as e:
+            log("CCU", f"Failed to update peak: {e}")
+
+    # button
+    view = discord.ui.View()
+    view.add_item(
+        discord.ui.Button(
+            label="▶️ Join Game",
+            url=f"https://www.roblox.com/games/{data['place_id']}"
+        )
+    )
+
+    # embed
+    embed = build_ccu_embed(data, current_peak)
+
+    # edit existing message
+    if ccu_message_id:
+        try:
+            msg = await channel.fetch_message(ccu_message_id)
+            await msg.edit(embed=embed, view=view)
+        except discord.NotFound:
+            ccu_message_id = None
+        except Exception as e:
+            log("CCU", f"Edit failed: {e}")
+            return
+
+    # send first message
+    if not ccu_message_id:
+        try:
+            msg = await safe_send(channel.send(embed=embed, view=view))
+            if msg:
+                ccu_message_id = msg.id
+        except Exception as e:
+            log("CCU", f"Send failed: {e}")
+            return
+
+    # peak ping
+    if new_peak:
+        try:
+            ghost = await channel.send("@here")
+            await ghost.delete()
+        except Exception as e:
+            log("CCU", f"Ghost ping failed: {e}")
+
+data = await fetch_roblox_game_data(ROBLOX_UNIVERSE_ID)
+
+if not data:
+    log("CCU", "Failed to fetch game data")
+    return
 
     try:
         current_peak = db_get_peak()
@@ -769,14 +877,20 @@ async def update_ccu():
         except Exception as e:
             log("CCU", f"Failed to write new peak to DB: {e}")
             return
-
-    embed = build_ccu_embed(ccu, current_peak)
+view = discord.ui.View()
+view.add_item(
+    discord.ui.Button(
+        label="▶️ Join Game",
+        url=f"https://www.roblox.com/games/{data['place_id']}"
+    )
+)
+embed = build_ccu_embed(data, current_peak)
 
     # Try to edit the existing embed message
     if ccu_message_id:
         try:
             msg = await channel.fetch_message(ccu_message_id)
-            await msg.edit(embed=embed)
+await msg.edit(embed=embed, view=view)
             log("CCU", f"Embed updated — CCU: {ccu}, Peak: {current_peak}")
         except discord.NotFound:
             ccu_message_id = None  # message was deleted, send a new one
